@@ -1,0 +1,280 @@
+use crate::DeviceSpec;
+use hidra::HidError;
+use thiserror::Error;
+
+#[cfg(test)]
+use crate::device_spec::DEVICE_BASE_SH68F90;
+
+#[derive(Debug, Clone, Error, PartialEq)]
+pub enum VerificationError {
+    #[error("Firmware Mismatch @ {addr:#06x} --- {expected:#04x} != {actual:#04x}")]
+    ByteMismatch {
+        addr: usize,
+        expected: u8,
+        actual: u8,
+    },
+    #[error("Length Mismatch {expected} {actual}")]
+    LengthMismatch { expected: usize, actual: usize },
+}
+
+pub fn verify(expected: &[u8], actual: &[u8]) -> Result<(), VerificationError> {
+    if expected.len() != actual.len() {
+        return Err(VerificationError::LengthMismatch {
+            expected: expected.len(),
+            actual: actual.len(),
+        });
+    }
+
+    for i in 0..expected.len() {
+        if expected[i] != actual[i] {
+            return Err(VerificationError::ByteMismatch {
+                addr: i,
+                expected: expected[i],
+                actual: actual[i],
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// `CLR EA; MOV SP,#0x70`, the first instructions of every known ISP bootloader.
+const BOOTLOADER_PROLOGUE: [u8; 5] = [0xc2, 0xaf, 0x75, 0x81, 0x70];
+
+/// ISP transfer HID collection; unlike the prologue it lies past the offset an [`crate::IspTransform`] starts mangling at.
+const BOOTLOADER_ISP_REPORT: [u8; 25] = [
+    0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x85, 0x06, 0x15, 0x00, 0x25, 0xff, 0x19, 0x01, 0x29,
+    0x02, 0x75, 0x08, 0x96, 0x01, 0x08, 0xb1, 0x02, 0xc0,
+];
+
+const BOOTLOADER_CHECK_CAUSES: &str = "the platform's firmware_size may be wrong (the read started at the wrong address), its bootloader_size may be wrong, or this device may need an isp_transform that its DeviceSpec does not declare";
+
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum BootloaderCheckError {
+    #[error(
+        "Bootloader starts with {} instead of {} - {}",
+        to_hex_string(.actual),
+        to_hex_string(&BOOTLOADER_PROLOGUE),
+        BOOTLOADER_CHECK_CAUSES
+    )]
+    MissingPrologue { actual: Vec<u8> },
+    #[error(
+        "Bootloader is missing the ISP transfer report descriptor - {}",
+        BOOTLOADER_CHECK_CAUSES
+    )]
+    MissingISPReport,
+}
+
+/// Sanity-checks a bootloader read against two fixed signatures; says nothing about the pages between them.
+pub fn check_bootloader(bootloader: &[u8]) -> Result<(), BootloaderCheckError> {
+    if !bootloader.starts_with(&BOOTLOADER_PROLOGUE) {
+        let end = BOOTLOADER_PROLOGUE.len().min(bootloader.len());
+        return Err(BootloaderCheckError::MissingPrologue {
+            actual: bootloader[..end].to_vec(),
+        });
+    }
+
+    if !bootloader
+        .windows(BOOTLOADER_ISP_REPORT.len())
+        .any(|w| w == BOOTLOADER_ISP_REPORT)
+    {
+        return Err(BootloaderCheckError::MissingISPReport);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum PayloadConversionError {
+    #[error("Expected LJMP not found at {addr:#06x}")]
+    LJMPNotFoundError { addr: u16 },
+    #[error("Unexpected addr at {source_addr:#06x} pointing to {target_addr:#06x}")]
+    UnexpectedAddressError { source_addr: u16, target_addr: u16 },
+}
+
+pub fn convert_to_jtag_payload(
+    input: &mut [u8],
+    device_spec: DeviceSpec,
+) -> Result<(), PayloadConversionError> {
+    if input[0] != 0x02 {
+        return Err(PayloadConversionError::LJMPNotFoundError { addr: 0x0000 });
+    }
+
+    let main_fw_address = u16::from_be_bytes(input[1..3].try_into().unwrap());
+    if main_fw_address > 0xefff {
+        return Err(PayloadConversionError::UnexpectedAddressError {
+            source_addr: 0x0001,
+            target_addr: main_fw_address,
+        });
+    }
+
+    let bootloader_ljmp_addr = (device_spec.platform.firmware_size as u16).to_be_bytes();
+    let ljmp_addr = device_spec.platform.firmware_size - 5;
+
+    input[1..3].copy_from_slice(&bootloader_ljmp_addr);
+    input[ljmp_addr] = 0x02;
+    input[ljmp_addr + 1..ljmp_addr + 3].copy_from_slice(&main_fw_address.to_be_bytes());
+
+    Ok(())
+}
+
+pub fn convert_to_isp_payload(
+    input: &mut [u8],
+    device_spec: DeviceSpec,
+) -> Result<(), PayloadConversionError> {
+    if input[0] != 0x02 {
+        return Err(PayloadConversionError::LJMPNotFoundError { addr: 0 });
+    }
+
+    let ljmp_addr = device_spec.platform.firmware_size - 5;
+    if input[ljmp_addr] != 0x02 {
+        return Err(PayloadConversionError::LJMPNotFoundError { addr: 0x0000 });
+    }
+
+    let main_fw_address =
+        u16::from_be_bytes(input[ljmp_addr + 1..ljmp_addr + 3].try_into().unwrap());
+    if main_fw_address > 0xefff {
+        return Err(PayloadConversionError::UnexpectedAddressError {
+            source_addr: (ljmp_addr + 1) as u16,
+            target_addr: main_fw_address,
+        });
+    }
+
+    input[1..3].copy_from_slice(&main_fw_address.to_be_bytes());
+    input[ljmp_addr..ljmp_addr + 3].fill(0x00);
+
+    Ok(())
+}
+
+pub fn to_hex_string(bytes: &[u8]) -> String {
+    let strs: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    strs.join(" ")
+}
+
+pub fn is_expected_error(err: &HidError) -> bool {
+    match err {
+        HidError::Disconnected | HidError::Backend { .. } => true,
+        // `Io` only exists on native targets; the WebHID backend reports the
+        // equivalent failures as `Disconnected` / `Backend`.
+        #[cfg(not(target_arch = "wasm32"))]
+        HidError::Io { .. } => true,
+        _ => false,
+    }
+}
+
+#[test]
+fn test_verify_success() {
+    assert!(verify(&[1, 2, 3, 4], &[1, 2, 3, 4]).is_ok());
+}
+
+#[test]
+fn test_verify_error_length_mismatch() {
+    assert_eq!(
+        verify(&[1, 2, 3, 4], &[1, 2, 3]),
+        Err(VerificationError::LengthMismatch {
+            expected: 4,
+            actual: 3
+        })
+    );
+}
+
+#[test]
+fn test_verify_error_byte_mismatch() {
+    assert_eq!(
+        verify(&[1, 2, 3, 4], &[1, 2, 4, 3]),
+        Err(VerificationError::ByteMismatch {
+            addr: 2,
+            expected: 3,
+            actual: 4
+        })
+    );
+}
+
+#[cfg(test)]
+fn fake_bootloader() -> Vec<u8> {
+    let mut blob = vec![0u8; 4096];
+    blob[..BOOTLOADER_PROLOGUE.len()].copy_from_slice(&BOOTLOADER_PROLOGUE);
+    blob[0x600..0x600 + BOOTLOADER_ISP_REPORT.len()].copy_from_slice(&BOOTLOADER_ISP_REPORT);
+    blob
+}
+
+#[test]
+fn test_check_bootloader_success() {
+    assert!(check_bootloader(&fake_bootloader()).is_ok());
+}
+
+#[test]
+fn test_check_bootloader_blank_region() {
+    assert_eq!(
+        check_bootloader(&[0u8; 4096]),
+        Err(BootloaderCheckError::MissingPrologue {
+            actual: vec![0, 0, 0, 0, 0]
+        })
+    );
+}
+
+#[test]
+fn test_check_bootloader_shifted_read() {
+    let blob = fake_bootloader();
+    assert_eq!(
+        check_bootloader(&blob[1..]),
+        Err(BootloaderCheckError::MissingPrologue {
+            actual: vec![0xaf, 0x75, 0x81, 0x70, 0x00]
+        })
+    );
+}
+
+#[test]
+fn test_check_bootloader_short_region() {
+    assert_eq!(
+        check_bootloader(&[0xc2, 0xaf]),
+        Err(BootloaderCheckError::MissingPrologue {
+            actual: vec![0xc2, 0xaf]
+        })
+    );
+}
+
+/// An unapplied `isp_transform` leaves the first six bytes untouched, so only the report descriptor catches it.
+#[test]
+fn test_check_bootloader_untransformed() {
+    let blob: Vec<u8> = fake_bootloader()
+        .iter()
+        .enumerate()
+        .map(|(i, b)| if i < 6 { *b } else { b.wrapping_add(0x5e) })
+        .collect();
+    assert_eq!(
+        check_bootloader(&blob),
+        Err(BootloaderCheckError::MissingISPReport)
+    );
+}
+
+#[test]
+fn test_convert_to_jtag_payload() {
+    let device_spec = DEVICE_BASE_SH68F90;
+    let mut firmware: [u8; 65536] = [0; 65536];
+    firmware[0] = 0x02;
+    firmware[1] = 0x00;
+    firmware[2] = 0x66;
+
+    convert_to_jtag_payload(&mut firmware, device_spec).unwrap();
+
+    assert_eq!(firmware[0..3], [0x02, 0xf0, 0x00]);
+    assert_eq!(firmware[0xeffb..0xeffe], [0x02, 0x00, 0x66]);
+}
+
+#[test]
+fn test_convert_to_isp_payload() {
+    let device_spec = DEVICE_BASE_SH68F90;
+    let mut firmware: [u8; 65536] = [0; 65536];
+    firmware[0] = 0x02;
+    firmware[1] = 0xf0;
+    firmware[2] = 0x00;
+    firmware[0xeffb] = 0x02;
+    firmware[0xeffc] = 0x00;
+    firmware[0xeffd] = 0x66;
+
+    convert_to_isp_payload(&mut firmware, device_spec).unwrap();
+
+    assert_eq!(firmware[0..3], [0x02, 0x00, 0x66]);
+    assert_eq!(firmware[0xeffb..0xeffe], [0x00, 0x00, 0x00]);
+}
